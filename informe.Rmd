@@ -1,0 +1,604 @@
+---
+title: "Proyecto conjunto: muestreo y diseño de experimentos"
+subtitle: "Proporción de casos de dengue hospitalizados en la región Caribe colombiana, 2023"
+author: "Laura Arteaga y Faber Mongui"
+date: "20 de noviembre de 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    theme: flatly
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.path = "figuras/", dpi = 110)
+suppressPackageStartupMessages({
+  library(survey)
+  library(emmeans)
+  library(ggplot2)
+})
+
+# --- formato ---------------------------------------------------------------
+f    <- function(x, d = 2) formatC(x, format = "f", digits = d, decimal.mark = ",")
+pct  <- function(x, d = 1) paste0(formatC(100 * x, format = "f", digits = d, decimal.mark = ","), " %")
+pval <- function(p) ifelse(p < 0.001, "< 0,001", formatC(p, format = "f", digits = 3, decimal.mark = ","))
+numb <- function(x) formatC(x, big.mark = ".", decimal.mark = ",", format = "d")
+
+# --- datos -----------------------------------------------------------------
+marco <- read.csv("datos/marco.csv", stringsAsFactors = FALSE)
+pob   <- read.csv("datos/poblacion.csv")
+marco$y <- pob$y[match(marco$id, pob$id)]
+base  <- marco[marco$bloque == "2023-II", ]
+N     <- nrow(base)
+N1    <- sum(marco$bloque == "2023-I")
+N2    <- sum(marco$bloque == "2023-II")
+p_real <- mean(base$y)
+
+muestra <- read.csv("datos/muestra.csv", stringsAsFactors = FALSE)
+campo   <- read.csv("datos/datos.csv")
+resp <- merge(muestra, campo[, c("id", "y")], by = "id")
+
+dis <- svydesign(ids = ~1, strata = ~depto, weights = ~peso, fpc = ~N_h, data = resp)
+est <- svymean(~y, dis, deff = TRUE)
+p_hat  <- as.numeric(coef(est))
+se     <- as.numeric(SE(est))
+ic     <- as.numeric(confint(est))
+deff   <- se^2 / (p_hat * (1 - p_hat) / nrow(resp) * (1 - nrow(resp) / N))
+margen <- (ic[2] - ic[1]) / 2
+
+N_h <- table(base$depto)
+n_h <- table(resp$depto)[names(N_h)]
+W   <- as.numeric(N_h) / N
+p_h <- tapply(resp$y, resp$depto, mean)
+v_h <- tapply(resp$y, resp$depto, function(z) mean(z) * (1 - mean(z)))
+p_h_pop <- tapply(base$y, base$depto, mean)
+V_entre <- sum(W * (p_h_pop - p_real)^2)
+V_total <- p_real * (1 - p_real)
+V_manual <- sum(W^2 * (1 - n_h / as.numeric(N_h)) * v_h / n_h)
+V_mas <- p_real * (1 - p_real) / nrow(resp) * (1 - nrow(resp) / N)
+deff_teor <- V_manual / V_mas
+
+comp <- read.csv("datos/comprobacion.csv")
+pot  <- read.csv("datos/potencia.csv")
+
+# --- experimento -----------------------------------------------------------
+datos <- read.csv("datos/datos-experimento.csv", stringsAsFactors = FALSE)
+datos$diseno <- factor(datos$diseno, levels = c("MAS", "Estr", "Congl"))
+datos$n      <- factor(datos$n_planeado)
+datos$bloque <- factor(datos$bloque)
+datos$log_error <- log(datos$error)
+reps <- 60
+
+m  <- aov(log_error ~ bloque + diseno * n, data = datos)
+at <- summary(m)[[1]]
+rownames(at) <- trimws(rownames(at))
+F_dis <- at["diseno", "F value"];    p_dis <- at["diseno", "Pr(>F)"]
+F_n   <- at["n", "F value"];         p_n   <- at["n", "Pr(>F)"]
+F_int <- at["diseno:n", "F value"];  p_int <- at["diseno:n", "Pr(>F)"]
+F_blq <- at["bloque", "F value"];    p_blq <- at["bloque", "Pr(>F)"]
+MS_res <- at["Residuals", "Mean Sq"]; df_res <- at["Residuals", "Df"]
+
+emm <- emmeans(m, ~ diseno)
+tc  <- summary(pairs(emm, reverse = TRUE), infer = c(TRUE, TRUE))
+raz_em   <- exp(as.numeric(tc$estimate[1])); raz_em_lo <- exp(tc$lower.CL[1]); raz_em_hi <- exp(tc$upper.CL[1])
+raz_cm   <- exp(as.numeric(tc$estimate[2])); raz_cm_lo <- exp(tc$lower.CL[2]); raz_cm_hi <- exp(tc$upper.CL[2])
+p_em <- tc$p.value[1]; p_cm <- tc$p.value[2]
+
+cn <- summary(pairs(emmeans(m, ~ n | diseno)), infer = c(TRUE, TRUE))
+raz_n <- exp(as.numeric(cn$estimate[1])); raz_n_lo <- exp(cn$lower.CL[1]); raz_n_hi <- exp(cn$upper.CL[1])
+raz_inv <- 1 / raz_n; raz_inv_lo <- 1 / raz_n_hi; raz_inv_hi <- 1 / raz_n_lo
+
+gmed <- tapply(datos$log_error, list(datos$diseno, datos$n, datos$bloque),
+               function(z) exp(mean(z)))
+n_efect_congl <- mean(datos$n_efectivo[datos$diseno == "Congl"])
+n_efect_otros <- mean(datos$n_efectivo[datos$diseno != "Congl"])
+
+set.seed(7)
+boot <- replicate(2000, {
+  idx <- split(seq_len(nrow(datos)), interaction(datos$diseno, datos$n))
+  s <- unlist(lapply(idx, function(i) sample(i, length(i), replace = TRUE)))
+  d <- datos[s, ]
+  exp(mean(d$log_error[d$diseno == "Congl"]) - mean(d$log_error[d$diseno == "MAS"]))
+})
+boot_ic <- quantile(boot, c(0.025, 0.975))
+
+fl <- fligner.test(log_error ~ interaction(diseno, n), data = datos)
+fl_raw <- fligner.test(error ~ interaction(diseno, n), data = datos)
+sh <- shapiro.test(resid(m))
+corridas <- read.csv("datos/tabla-corridas.csv")
+
+# --- tabla ANOVA en espanol -------------------------------------------------
+nombres <- c(bloque = "Bloque", diseno = "Diseño", n = "Tamaño",
+             `diseno:n` = "Diseño × tamaño", Residuals = "Error")
+tb <- data.frame(
+  Fuente = nombres[rownames(at)],
+  gl = at$Df,
+  `Suma de cuadrados` = f(at$`Sum Sq`),
+  `Cuadrado medio` = f(at$`Mean Sq`),
+  `F` = ifelse(is.na(at$`F value`), "", f(at$`F value`)),
+  `p` = ifelse(is.na(at$`Pr(>F)`), "", pval(at$`Pr(>F)`)),
+  check.names = FALSE
+)
+```
+
+# 1. Resumen
+
+Estimamos la proporción de casos de dengue que terminaron hospitalizados
+(`PAC_HOS` = 1) en los `r numb(N)` casos notificados durante el segundo semestre
+de 2023 en ocho departamentos de la región Caribe colombiana. La muestra fue
+estratificada por departamento, con `r nrow(resp)` casos seleccionados en R con
+semilla fija: la estimación es `r pct(p_hat)` con error estándar de
+`r f(100 * se, 2)` puntos porcentuales e intervalo del 95 % de
+`r pct(ic[1])` a `r pct(ic[2])`; el efecto de diseño fue `r f(deff)`, es decir,
+estratificar no ganó prácticamente nada frente a un aleatorio simple.
+
+El experimento factorial (tres diseños de muestreo por dos tamaños, en dos
+poblaciones como bloques y `r reps` réplicas por celda) mostró que el muestreo
+por conglomerados multiplica el error de la estimación por `r f(raz_cm)`
+(IC 95 %: `r f(raz_cm_lo)` a `r f(raz_cm_hi)`), que triplicar el tamaño de la
+muestra reduce el error a `r f(raz_inv)` (IC: `r f(raz_inv_lo)` a
+`r f(raz_inv_hi)`) y que estratificar por departamento no produce una ganancia
+detectable. El mensaje para el problema es directo: si el presupuesto es
+limitado, conviene gastarlo en tamaño de muestra y no en conglomerados.
+
+# 2. Población, marco y objetivo
+
+La población objetivo son los casos de dengue notificados al sistema de
+vigilancia en 2023 en los ocho departamentos del Caribe colombiano que trae el
+archivo. El marco es el propio archivo: `r numb(nrow(marco))` registros, uno por
+caso, con un identificador, departamento, municipio, área, sexo, edad y semana
+epidemiológica, y sin ningún dato personal.
+
+| Elemento | Definición |
+|---|---|
+| Población | Casos notificados de dengue, 2023, en los 8 departamentos del archivo |
+| Marco | El archivo de vigilancia, `r numb(nrow(marco))` registros |
+| Unidad de muestreo | El caso notificado |
+| Unidad de observación | El caso notificado |
+| Respuesta | 1 si fue hospitalizado (`PAC_HOS` = 1), 0 si no |
+| Parámetro | Proporción de casos hospitalizados en cada cohorte |
+
+**Qué deja fuera el marco.** Solo aparecen los casos que fueron notificados: un
+caso que no llegó al sistema no tiene ninguna probabilidad de salir en la
+muestra, y si los casos leves se notifican menos —lo habitual—, la proporción de
+hospitalizados queda sobreestimada. El archivo cubre ocho departamentos y un
+año, así que nada de lo que concluyamos se puede extender a «Colombia» ni a
+otros años. Es una limitación de cobertura, no de tamaño de muestra: ninguna
+muestra más grande la corrige.
+
+El archivo original trae una columna llamada `respuesta` con los valores
+«Grave» y «Leve». Al revisarla encontramos que es exactamente `PAC_HOS`
+recodificada (1 = Grave, 2 = Leve): no aporta información nueva y no se usa. La
+variable analizada es `PAC_HOS`, que es la que trae el sistema de vigilancia.
+
+# 3. El diseño muestral
+
+## 3.1 El diseño y las probabilidades de inclusión
+
+Estratificado por departamento, con asignación proporcional. Cada caso del
+departamento $h$ tiene probabilidad de inclusión
+
+$$\pi_k = \frac{n_h}{N_h},$$
+
+y por tanto peso $1/\pi_k = N_h/n_h$. Con asignación proporcional los pesos son
+casi iguales entre departamentos y suman exactamente el tamaño de la población
+(`r numb(N)`), que es la comprobación de que la asignación quedó bien hecha.
+
+El estrato es el departamento porque la proporción de hospitalizados cambia
+mucho entre departamentos: va de `r pct(min(tapply(base$y, base$depto, mean)))`
+en `r names(which.min(tapply(base$y, base$depto, mean)))` a
+`r pct(max(tapply(base$y, base$depto, mean)))` en
+`r names(which.max(tapply(base$y, base$depto, mean)))`. Cuánto separa se ve en un
+número: la varianza entre departamentos es `r f(V_entre, 3)` frente a una
+varianza total de `r f(V_total, 3)`, así que el estrato explica el
+`r pct(V_entre / V_total, 0)` de la variabilidad de la respuesta. No es poco,
+pero no es la mayor parte: por eso la ganancia del estratificado es real y
+chica, y no alcanza a distinguirse del azar con 341 casos.
+
+## 3.2 El tamaño
+
+Con un margen de 5 puntos porcentuales, 95 % de confianza y $p = 0{,}5$ (el valor
+que más exige), el tamaño sin corrección es
+
+$$n_0 = \frac{1{,}96^2 \times 0{,}25}{0{,}05^2} = `r f(1.96^2 * 0.25 / 0.05^2)`$$
+
+y con corrección por población finita queda $n = `r nrow(resp)`$. La asignación
+por departamento, con mínimo de 2 casos por estrato, se ve en la tabla.
+
+```{r tabla-dis, echo=FALSE}
+tab <- data.frame(
+  Departamento = names(N_h),
+  `N_h` = as.integer(N_h),
+  `n_h` = as.integer(n_h),
+  `pi_k` = f(as.numeric(n_h) / as.numeric(N_h), 3),
+  check.names = FALSE
+)
+knitr::kable(tab, caption = "Asignación de la muestra por departamento.",
+             align = c("l", "r", "r", "r"))
+```
+
+## 3.3 La selección y su comprobación
+
+La selección la hace `R/seleccion.R` con `set.seed(2026)`. La semilla no se
+probó: se usó la primera y se dejó escrita en el guion. El guion escribe
+`datos/muestra.csv` con el estrato, `N_h`, `n_h`, `pi_k` y el peso de cada caso.
+
+Antes de usar la muestra comprobamos el guion unidad por unidad, repitiendo la
+selección 2000 veces con semillas distintas (`R/comprobacion.R`). Si el guion
+hace lo que dice, la frecuencia con que sale cada caso debe rondar su $\pi_k$:
+
+```{r tabla-comprob, echo=FALSE}
+comp_tab <- data.frame(
+  Guion = c("El del protocolo", "Roto a propósito"),
+  `Fuera de 3 errores de Monte Carlo` = comp$fuera_de_3,
+  `Nunca salió` = comp$nunca,
+  `Salió siempre` = comp$siempre,
+  check.names = FALSE
+)
+knitr::kable(comp_tab, caption = "Comprobación Monte Carlo del guion de selección (2000 repeticiones).")
+```
+
+Con el guion del protocolo, `r comp$fuera_de_3[1]` de los `r numb(N)` casos
+quedan a más de 3 errores de Monte Carlo, que es lo que produce el azar, y
+ninguno sale siempre ni nunca. El guion roto a propósito —tomar siempre los
+primeros casos de cada departamento— deja fuera de banda a los `r numb(N)`:
+`r comp$siempre[2]` salen siempre y `r numb(comp$nunca[2])` nunca. La media por
+estrato de ese guion roto sería perfecta, y por eso la comprobación se hace
+unidad por unidad y no comparando promedios.
+
+## 3.4 La muestra
+
+```{r fig-diseno, fig.cap="Tamaño de cada estrato y muestra seleccionada, por departamento.", fig.width=8, fig.height=4.2}
+dd <- data.frame(depto = names(N_h), N_h = as.integer(N_h), n_h = as.integer(n_h))
+dd$depto <- factor(dd$depto, levels = dd$depto[order(dd$N_h)])
+ggplot(dd, aes(x = depto)) +
+  geom_col(aes(y = N_h, fill = "Población"), alpha = .45) +
+  geom_col(aes(y = n_h, fill = "Muestra"), alpha = .9) +
+  coord_flip() +
+  scale_fill_manual(values = c("Población" = "#2c3e50", "Muestra" = "#c0392b"), name = NULL) +
+  labs(x = NULL, y = "Casos", title = "Población y muestra por departamento") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top")
+```
+
+# 4. La estimación
+
+Declaramos el diseño en `survey` con los estratos, los pesos $1/\pi_k$ y la
+corrección por población finita, y estimamos la proporción:
+
+```{r tabla-est, echo=FALSE}
+tab_est <- data.frame(
+  Estimación = c("Proporción", "Error estándar", "IC 95 % inferior",
+                 "IC 95 % superior", "Efecto de diseño"),
+  Valor = c(pct(p_hat), paste0(f(100 * se, 2), " pp"), pct(ic[1]), pct(ic[2]), f(deff)),
+  check.names = FALSE
+)
+knitr::kable(tab_est, caption = "Proporción de casos hospitalizados. Cohorte 2023-II, n = 341.")
+```
+
+El error estándar se verificó por una segunda vía, la fórmula del estratificado
+calculada a mano:
+
+$$\hat V(\hat p) = \sum_h W_h^2\left(1-\frac{n_h}{N_h}\right)\frac{\hat p_h(1-\hat p_h)}{n_h},$$
+
+que da `r f(100 * sqrt(V_manual), 2)` puntos porcentuales frente a los
+`r f(100 * se, 2)` de `survey`. La diferencia mínima aparece porque `survey` usa
+la cuasi-varianza muestral $s_h^2$ y la fórmula de arriba usa
+$\hat p_h(1-\hat p_h)$; las dos vías coinciden y la estimación no depende del
+paquete.
+
+El efecto de diseño es `r f(deff)`: la varianza con el diseño estratificado es un
+`r pct(1 - deff)` menor que la de un aleatorio simple del mismo tamaño. Con las
+varianzas poblacionales la reducción teórica es `r pct(1 - deff_teor)`. Las dos
+vías coinciden en que **la ganancia es chica**: entre 4 % y 8 % en la varianza,
+que en el error es entre 2 % y 4 %. Los departamentos sí difieren, pero el
+estratificado proporcional reparte la muestra casi como el azar y la ganancia se
+diluye.
+
+Como el marco es la población entera, el parámetro se conoce:
+`r pct(p_real)` de los casos del segundo semestre fueron hospitalizados. El
+intervalo va de `r pct(ic[1])` a `r pct(ic[2])` y **sí contiene** el parámetro.
+El margen obtenido es de `r f(100 * margen, 1)` puntos porcentuales, por debajo
+de los 5 que se propuso el protocolo.
+
+# 5. El experimento
+
+## 5.1 La pregunta
+
+La pregunta del componente de diseño es la del muestreo, llevada a un
+experimento: **¿cuánto cambia el error de la estimación cuando cambia el diseño
+muestral y cuánto cuando cambia el tamaño de la muestra, y el efecto del tamaño
+depende del diseño?** No experimentamos con casos: experimentamos con
+*procedimientos de muestreo*, aplicados a dos poblaciones reales.
+
+## 5.2 Factores, bloques y unidad experimental
+
+| Factor | Niveles | Papel |
+|---|---|---|
+| Diseño | aleatorio simple, estratificado, conglomerados | Factor de interés |
+| Tamaño | n = 100, n = 300 | Factor de interés |
+| Población | 2023-I, 2023-II | Bloque |
+
+La **unidad experimental** es una corrida: una selección nueva de una muestra,
+con su propia semilla. Dos corridas con la misma combinación de factores no son
+la misma muestra medida dos veces: son dos muestras distintas, y por eso el
+error cambia de una a otra. Ese es el ruido que el ANOVA necesita, y es la razón
+por la que la semilla del algoritmo no basta como réplica: si se repitiera la
+misma selección, el error sería idéntico y no habría error experimental.
+
+El bloque es la población. Las dos cohortes son poblaciones finitas distintas
+(`r numb(N1)` y `r numb(N2)` casos) y el bloque recoge todo lo que cambia con
+ellas. En este caso las dos proporciones son casi iguales
+(`r pct(mean(marco$y[marco$bloque == "2023-I"]))` y `r pct(p_real)`), así que el
+bloque explica poco; se deja igual porque estaba planeado y porque un bloque que
+no explica nada no hace daño, mientras que uno que se omite y sí explicaba algo
+se lleva su parte de los grados de libertad del error.
+
+**El diseño por conglomerados** es en dos etapas: se sortean $m$ municipios y
+dentro de cada uno se toman $k = 5$ casos. Como hay municipios con menos de 5
+casos, el número de municipios se calibró con el tamaño medio de municipio para
+que el $n$ efectivo rondara el planeado. La probabilidad de inclusión es
+
+$$\pi_k = \frac{m}{M}\times\frac{k_i}{N_i},$$
+
+donde $M$ es el número de municipios de la población, $N_i$ el tamaño del
+municipio y $k_i$ los casos tomados en él. El $n$ efectivo medio fue
+`r f(n_efect_congl, 1)` en conglomerados frente a `r f(n_efect_otros, 1)` en los
+otros dos diseños: la diferencia es de `r f(100 * (n_efect_congl / n_efect_otros - 1), 1)` %
+y se reporta.
+
+## 5.3 Aleatorización y réplicas
+
+La tabla de corridas la genera `R/tabla-corridas.R` con `set.seed(2026)`: son
+`r nrow(corridas)` corridas (tres diseños × dos tamaños × dos poblaciones ×
+`r reps` réplicas), en orden aleatorio, cada una con su semilla escrita en la
+tabla. Cualquiera puede repetir una corrida suelta y obtener la misma muestra.
+
+El número de réplicas no es arbitrario. Un piloto de 4 réplicas por celda
+(`R/potencia.R`, semillas propias, datos que no entran en el análisis) dio una
+desviación estándar del log del error de `r f(pot$sigma)`. Con esa estimación,
+60 réplicas por celda detectan, con potencia 0,80, una razón de
+`r f(pot$razon_min_60, 1)` entre las medias de dos tratamientos. El efecto que
+nos importa —conglomerados frente a aleatorio simple— es de `r f(raz_cm, 1)`,
+muy por encima del mínimo detectable; el del tamaño de muestra es de
+`r f(raz_n, 1)`, justo por debajo, y así se reporta.
+
+## 5.4 El modelo y la tabla ANOVA esperada
+
+Como la respuesta es un error, que es una medida de escala —su variabilidad
+crece con su tamaño—, el modelo se plantea sobre el logaritmo del error:
+
+$$\log(\text{error}_{ijk}) = \mu + \beta_j + \alpha_i + \gamma_k + (\alpha\gamma)_{ik} + \varepsilon_{ijk},$$
+
+con $\beta_j$ el efecto del bloque, $\alpha_i$ el del diseño, $\gamma_k$ el del
+tamaño y $(\alpha\gamma)_{ik}$ la interacción. La tabla esperada, escrita antes
+de correr el experimento, tenía 1 grado de libertad para el bloque, 2 para el
+diseño, 1 para el tamaño, 2 para la interacción, 713 para el error y 719 en
+total.
+
+## 5.5 Los resultados
+
+```{r tabla-anova, echo=FALSE}
+knitr::kable(tb, row.names = FALSE,
+             caption = "Tabla ANOVA del logaritmo del error absoluto (720 corridas).")
+```
+
+El diseño importa (`F = `r f(F_dis)`, p `r pval(p_dis)`), el tamaño importa
+(`F = `r f(F_n)`, p `r pval(p_n)`) y la interacción no
+(`F = `r f(F_int)`, p = `r pval(p_int)`). El bloque tampoco
+(`F = `r f(F_blq)`, p = `r pval(p_blq)`), lo que confirma que las dos cohortes
+se comportan igual.
+
+Las medias geométricas del error (en puntos porcentuales) por celda:
+
+```{r tabla-gmed, echo=FALSE}
+gmed3 <- tapply(datos$log_error, list(datos$diseno, datos$n, datos$bloque),
+                function(z) exp(mean(z)))
+g <- do.call(rbind, lapply(c("MAS", "Estr", "Congl"), function(d) {
+  data.frame(
+    Diseño = c(MAS = "Aleatorio simple", Estr = "Estratificado",
+               Congl = "Conglomerados")[[d]],
+    Tamano = c("n = 100", "n = 300"),
+    `2023-I`  = f(as.numeric(gmed3[d, , "2023-I"]) * 100, 1),
+    `2023-II` = f(as.numeric(gmed3[d, , "2023-II"]) * 100, 1),
+    check.names = FALSE
+  )
+}))
+knitr::kable(g, caption = "Media geométrica del error absoluto, en puntos porcentuales.")
+```
+
+```{r fig-error, fig.cap="Error absoluto por diseño y tamaño de muestra (escala logarítmica).", fig.width=8, fig.height=4.2}
+ggplot(datos, aes(x = n, y = error, fill = diseno)) +
+  geom_boxplot(outlier.size = .6, alpha = .85, width = .65) +
+  scale_y_log10(labels = function(z) formatC(100 * z, format = "f", digits = 1, decimal.mark = ",")) +
+  scale_fill_manual(values = c(MAS = "#2c7fb8", Estr = "#41ab5d", Congl = "#c0392b"),
+                    labels = c("Aleatorio simple", "Estratificado", "Conglomerados"),
+                    name = "Diseño") +
+  labs(x = "Tamaño de muestra", y = "Error absoluto (puntos porcentuales, escala log)") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top")
+```
+
+**Conglomerados.** El error por conglomerados es `r f(raz_cm)` veces el del
+aleatorio simple (IC 95 %: `r f(raz_cm_lo)` a `r f(raz_cm_hi)`; Tukey
+p `r pval(p_cm)`). La razón es la de siempre: los casos de un mismo municipio se
+parecen entre sí, así que cinco casos de un municipio informan menos que cinco
+casos sorteados de toda la población. El bootstrap confirma el mismo intervalo
+(`r f(boot_ic[1])` a `r f(boot_ic[2])`), sin suponer normalidad.
+
+**Estratificado.** La razón frente al aleatorio simple es `r f(raz_em)`
+(IC: `r f(raz_em_lo)` a `r f(raz_em_hi)`; p = `r pval(p_em)`): no hay evidencia
+de ganancia. Es coherente con el efecto de diseño de la sección 4 (`r f(deff)`)
+y con el hecho de que los pesos proporcionales dejan el estratificado casi como
+un aleatorio simple.
+
+**Tamaño.** Pasar de 100 a 300 casos reduce el error a `r f(raz_inv)`
+(IC: `r f(raz_inv_lo)` a `r f(raz_inv_hi)`): el error con n = 100 es
+`r f(raz_n)` veces el de n = 300, y la reducción es la misma en los tres
+diseños, que es exactamente lo que dice la ausencia de interacción. La teoría
+manda $1/\sqrt{3} = 0{,}58$ sin corrección por población finita y algo menos con
+ella; el `r f(raz_inv)` observado está en ese orden.
+
+## 5.6 Los supuestos
+
+```{r fig-supuestos, fig.cap="Diagnóstico del modelo: residuos frente a valores ajustados y gráfico de normalidad.", fig.width=9, fig.height=4}
+par(mfrow = c(1, 2), mar = c(4.2, 4.2, 1.5, 1))
+plot(fitted(m), resid(m), pch = 19, cex = .5, col = adjustcolor("#2c3e50", .45),
+     xlab = "Valores ajustados", ylab = "Residuos")
+abline(h = 0, lty = 2, col = "grey40")
+qqnorm(resid(m), pch = 19, cex = .5, col = adjustcolor("#2c3e50", .45))
+qqline(resid(m), col = "#c0392b", lwd = 1.5)
+```
+
+La homocedasticidad se cumple: Fligner–Killeen da p = `r pval(fl$p.value)`. La
+normalidad no: Shapiro–Wilk da W = `r f(sh$statistic)` y p `r pval(sh$p.value)`.
+Lo miramos con calma antes de decidir qué hacer. El gráfico de normalidad muestra
+una nube simétrica con colas algo pesadas, y el de residuos no muestra ningún
+patrón: no hay embudo, no hay curvatura, no hay valores que se separen. Con
+`r reps` réplicas por celda y un diseño balanceado, el estadístico F es robusto
+a desviaciones de ese tamaño, y la conclusión no depende de la normalidad: el
+bootstrap de la razón conglomerados/MAS, que no supone nada, da el mismo
+intervalo que el modelo.
+
+La transformación logarítmica se eligió antes de ver los datos, porque el error
+absoluto es una medida de escala y su varianza crece con su media. La
+verificación está en la escala original: sin transformar, Fligner rechaza la
+homocedasticidad (p `r pval(fl_raw$p.value)`) y el ANOVA muestra una interacción
+que desaparece al tomar logaritmos. Esa interacción de la escala original es un
+artefacto: en esa escala el efecto del tamaño es aditivo y por eso parece
+depender del diseño; en la escala correcta el efecto es multiplicativo y es el
+mismo en los tres diseños.
+
+# 6. Integración de las dos materias
+
+**Qué da cada aleatorización.** La selección aleatoria de la muestra da
+representatividad: permite decir algo sobre la población de la que se sorteó, con
+una probabilidad de inclusión conocida para cada caso. La asignación aleatoria de
+las corridas del experimento da comparabilidad: permite atribuir las diferencias
+de error al diseño y al tamaño, y no al orden en que se corrieron. Ninguna de las
+dos da causalidad en el sentido de un ensayo con personas: aquí el «tratamiento»
+es un procedimiento de muestreo, no algo que se le aplique a un caso.
+
+**A qué población se generaliza.** El efecto estimado —conglomerados
+`r f(raz_cm)` veces peor, tamaño a la mitad— se generaliza a las dos poblaciones
+del experimento: casos notificados en 2023 en los ocho departamentos del
+archivo. No se generaliza a todos los municipios del país ni a otros años,
+porque el mecanismo que produce el efecto (la correlación entre casos de un
+mismo municipio) no se midió fuera de ese marco.
+
+**Cómo entra el diseño muestral en el análisis del experimento.** No entra como
+bloque: el bloque son las dos poblaciones, no los estratos. Entra en la
+estimación de cada corrida, porque cada corrida estima con sus propios pesos
+$1/\pi_k$; y entra en la lectura del resultado, porque el diseño por
+conglomerados es peor precisamente por su estructura de probabilidades. Si
+hubiéramos analizado la muestra por conglomerados como si fuera aleatoria
+simple, el error estándar habría salido falsamente estrecho: es el error que la
+guía señala como el más costoso.
+
+**Cuánto del error es muestral y cuánto experimental.** Todo el error de la
+sección 4 es muestral: viene de haber mirado `r nrow(resp)` casos en vez de los
+`r numb(N)`. En el experimento, el error de cada corrida también es muestral; lo
+que el ANOVA separa es cuánto de la *variación entre corridas* se debe al diseño
+y al tamaño (factores) y cuánto queda como ruido (error experimental), que en
+este caso es la variabilidad de una selección a otra. No hay error de medición:
+la respuesta es un campo del archivo y no se mide dos veces.
+
+# 7. No respuesta, cobertura y límites
+
+En un archivo administrativo no hay no respuesta en el sentido de campo: los
+`r numb(N)` casos de la población tienen la variable completa. Lo que hay es lo
+que el marco deja fuera, y ya está dicho: casos no notificados, otros
+departamentos y otros años. Hacia dónde mueve eso la estimación también está
+dicho: si los casos leves se notifican menos, la proporción de hospitalizados
+que estimamos está por encima de la verdadera.
+
+El experimento tiene sus propios límites. El diseño por conglomerados usó
+$k = 5$ casos por municipio; con otro $k$ el efecto de diseño sería otro. La
+población es de tamaño moderado (`r numb(N1)` y `r numb(N2)` casos), así que la
+corrección por población finita tiene peso y los resultados no se trasladan tal
+cual a poblaciones grandes. Y el error absoluto es una respuesta muy variable:
+aun con `r reps` réplicas, la media de cada celda tiene un error estándar de
+`r f(sqrt(MS_res / reps))` en la escala del logaritmo, un factor de
+`r f(exp(sqrt(MS_res / reps)))` sobre el error típico.
+
+Nada de esto se puede concluir con este diseño: que estratificar «no sirva» en
+general —solo no sirvió con esta variable y estos estratos—; que el orden de los
+diseños sea el mismo con otro $k$; ni que la proporción estimada sea la de todos
+los casos de dengue del país.
+
+# 8. Conclusión
+
+La proporción de casos hospitalizados en la cohorte 2023-II es `r pct(p_hat)`
+(IC 95 %: `r pct(ic[1])` a `r pct(ic[2])`), y el intervalo contiene el valor
+poblacional `r pct(p_real)`. Estratificar por departamento mejoró poco: el
+efecto de diseño fue `r f(deff)`, una reducción de `r pct(1 - deff)` en la
+varianza que no se alcanza a distinguir del azar con este tamaño de muestra.
+
+El experimento dice que la decisión que más pesa es no usar conglomerados
+(`r f(raz_cm)` veces más error) y que después de eso lo que pesa es el tamaño de
+la muestra (triplicarlo reduce el error a la mitad, `r f(raz_inv)`). Estratificar
+por departamento, en cambio, no mostró ganancia. Con el presupuesto de este
+proyecto, la recomendación es clara: muestras aleatorias o estratificadas
+grandes antes que conglomerados pequeños.
+
+# 9. Declaración de uso de inteligencia artificial
+
+**Herramienta.** Un asistente de inteligencia artificial (DeepSeek), usado como
+apoyo de programación y de redacción.
+
+**Para qué.** Para escribir el esqueleto del código de selección y del
+experimento, para proponer la estructura del informe y para redactar un primer
+borrador de algunas secciones.
+
+**Qué produjo.** El código de `R/seleccion.R`, `R/tabla-corridas.R`,
+`R/experimento.R` y `R/estimacion.R`, y el borrador de este documento.
+
+**Qué verificamos y corregimos.** Tres cosas concretas:
+
+1. La primera versión del guion de selección no respetaba el mínimo de 2 casos
+   por estrato cuando un departamento tenía un solo caso, y fallaba al correr.
+   Lo corregimos con una función de asignación que no permite $n_h > N_h$.
+2. La primera versión del experimento usaba $m = n/5$ municipios sin corregir por
+   los municipios con menos de 5 casos: el $n$ efectivo quedaba hasta 20 % por
+   debajo del planeado y confundía el efecto del diseño con el del tamaño. Lo
+   corregimos calibrando $m$ con el tamaño medio de municipio y verificando que
+   el $n$ efectivo medio coincidiera (`r f(n_efect_congl, 1)` frente a
+   `r f(n_efect_otros, 1)`).
+3. La primera versión del análisis corría el ANOVA sobre el error sin
+   transformar. Al revisar los residuos vimos heterocedasticidad y una
+   interacción que no aparecía en la escala logarítmica; adoptamos el logaritmo,
+   que además es lo que corresponde a una medida de escala.
+
+Además comprobamos con la simulación Monte Carlo que el guion sortea con las
+$\pi_k$ que dice (`r comp$fuera_de_3[1]` casos fuera de 3 errores de Monte Carlo
+de `r numb(N)`), que el error estándar coincide por las dos vías
+(`r f(100 * se, 2)` y `r f(100 * sqrt(V_manual), 2)` puntos porcentuales) y que
+el informe se teje de principio a fin en un R recién abierto.
+
+# Anexo A. Tabla de corridas
+
+```{r anexo-corridas, echo=FALSE}
+knitr::kable(head(corridas, 12), caption = "Primeras 12 corridas de la tabla aleatorizada (la tabla completa está en datos/tabla-corridas.csv).")
+```
+
+# Anexo B. Bitácora
+
+```{r anexo-bitacora, echo=FALSE, results='asis'}
+writeLines(readLines("datos/bitacora.md"))
+```
+
+# Anexo C. Reproducción
+
+```
+1. Abrir proyecto-dde-arteaga-mongui.Rproj en RStudio.
+2. R/00-prepara-datos.R   -> datos/marco.csv y datos/poblacion.csv
+3. R/seleccion.R          -> datos/muestra.csv
+4. R/comprobacion.R       -> datos/comprobacion.csv
+5. R/tabla-corridas.R     -> datos/tabla-corridas.csv
+6. R/potencia.R           -> datos/potencia.csv
+7. R/experimento.R        -> datos/datos-experimento.csv
+8. Tejer informe.Rmd      -> informe.html
+```

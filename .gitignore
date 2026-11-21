@@ -1,0 +1,14 @@
+# Lo que R genera solo y no se sube
+.Rhistory
+.RData
+.Rproj.user/
+*.Rcheck/
+
+# Salidas temporales
+informe-plano.txt
+informe.log
+informe.aux
+
+# Sistema
+.DS_Store
+Thumbs.db
